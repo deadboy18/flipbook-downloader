@@ -165,6 +165,15 @@ def get_safe_filename(title, default="book"):
     return safe_title[:100]
 
 
+# The output directory for saved PDFs: same folder the script lives in.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_output_path(filename):
+    """Return an absolute path in the script's directory for the given filename."""
+    return os.path.join(SCRIPT_DIR, filename)
+
+
 def detect_site(url: str) -> str:
     """Return 'anyflip', 'fliphtml5', or 'unknown'."""
     u = url.lower()
@@ -336,12 +345,32 @@ def anyflip_make_pdf(images, output_path):
     if len(valid) < len(images):
         logger.warning(f"   Discarded {len(images) - len(valid)} corrupt page(s); building PDF from {len(valid)}.")
 
-    pil_images = []
+    # img2pdf can't handle webp (and some JPEG variants cause encoder errors),
+    # so normalise every page to PNG first — same strategy the WASM path uses.
+    final_images = []
     for img in tqdm.tqdm(valid, desc="🖨️  Creating PDF", unit="page", leave=True):
-        pil_images.append(Image.open(img).convert("RGB"))
+        img_str = str(img)
+        if img_str.lower().endswith('.webp'):
+            try:
+                png = img_str.replace('.webp', '.png')
+                with Image.open(img) as im:
+                    im.convert("RGB").save(png, 'PNG')
+                final_images.append(png)
+            except Exception:
+                final_images.append(img_str)
+        else:
+            # For JPEG/other formats, convert to PNG too to avoid CMYK / subsampling issues
+            try:
+                png = img_str + '.png'
+                with Image.open(img) as im:
+                    im.convert("RGB").save(png, 'PNG')
+                final_images.append(png)
+            except Exception:
+                final_images.append(img_str)
 
-    pil_images[0].save(output_path, save_all=True, append_images=pil_images[1:])
-    logger.info(f"🎉 PDF Successfully Saved: {output_path}")
+    with open(output_path, "wb") as f:
+        f.write(img2pdf.convert(final_images))
+    logger.info(f"🎉 PDF Successfully Saved: {os.path.abspath(output_path)}")
     return True
 
 
@@ -354,9 +383,9 @@ def run_anyflip_fast(book_id: str, custom_filename: str):
         images = anyflip_download_pages_fast(book_id, pages_dir)
 
         if custom_filename:
-            output_path = get_safe_filename(custom_filename)
+            output_path = _resolve_output_path(get_safe_filename(custom_filename))
         else:
-            output_path = get_safe_filename(book_id.replace("/", "_"))
+            output_path = _resolve_output_path(get_safe_filename(book_id.replace("/", "_")))
 
         logger.info(f"Determined Output Filename: {output_path}")
         return anyflip_make_pdf(images, output_path)
@@ -815,7 +844,7 @@ async def run_wasm_decoder_path(
 
         # Determine filename
         if custom_filename:
-            output_path = get_safe_filename(custom_filename)
+            output_path = _resolve_output_path(get_safe_filename(custom_filename))
         else:
             raw_title = (
                 book_data.get('bookTitle')
@@ -823,7 +852,7 @@ async def run_wasm_decoder_path(
                 or book_data.get('name')
                 or book_id.replace("/", "_")
             )
-            output_path = get_safe_filename(raw_title)
+            output_path = _resolve_output_path(get_safe_filename(raw_title))
 
         logger.info(f"Determined Output Filename: {output_path}")
 
@@ -979,6 +1008,8 @@ async def main():
     print("   📖 FlipBook Batch Downloader 📖")
     print("   Supports: AnyFlip + FlipHTML5")
     print("========================================")
+    print(f"   📂 PDFs will be saved to: {SCRIPT_DIR}")
+    print()
 
     queue = []
 
