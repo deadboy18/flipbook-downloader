@@ -9,7 +9,10 @@ import logging
 import json
 import base64
 import re
+import posixpath
+import time as _time_mod
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==============================================================================
@@ -160,6 +163,11 @@ def get_safe_filename(title, default="book"):
     if not title:
         title = default
     safe_title = re.sub(r'[\\/*?:"<>|]', "", str(title)).strip()
+    # Go reference: trim trailing dots/spaces — Windows silently strips them,
+    # which causes "path not found" errors on save.
+    safe_title = safe_title.strip(". ")
+    if not safe_title:
+        safe_title = default
     if not safe_title.lower().endswith(".pdf"):
         safe_title += ".pdf"
     return safe_title[:100]
@@ -199,121 +207,179 @@ def anyflip_extract_book_id(url):
     return f"{m.group(1)}/{m.group(2)}"
 
 
+def anyflip_fetch_config(book_id, headers):
+    """Fetch config.js and extract page count + filenames + title — same approach the
+    Go reference downloader uses.  One HTTP request, zero guessing.
+
+    Returns (page_count, page_filenames_list_or_None, book_title_or_None, config_text)."""
+    config_url = f"https://online.anyflip.com/{book_id}/mobile/javascript/config.js"
+    try:
+        r = requests.get(config_url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return 0, None, None, None
+        text = r.text
+    except Exception:
+        return 0, None, None, None
+
+    # --- page count (mirrors Go: `"?(bookConfig\.)?(total)?[Pp]ageCount"?[=:]"?\d+"?`) ---
+    page_count = 0
+    m = re.search(r'"?(bookConfig\.)?(total)?[Pp]ageCount"?\s*[=:]\s*"?(\d+)"?', text)
+    if m:
+        page_count = int(m.group(3))
+
+    # --- page filenames (mirrors Go: `"n":["..."]` per page) ---
+    raw_names = re.findall(r'"n":\["([^"]+)"\]', text)
+    filenames = []
+    for name in raw_names:
+        # Unescape JSON backslashes: `..\/files\/mobile\/1.webp` → `../files/mobile/1.webp`
+        clean = name.replace("\\/", "/")
+        filenames.append(clean)
+
+    # --- book title (mirrors Go: `bookTitle=` or `"title":"..."`) ---
+    book_title = None
+    tm = re.search(r'("?(bookConfig\.)?bookTitle"?\s*=\s*"([^"]*)")|"title"\s*:\s*"([^"]*)"', text)
+    if tm:
+        book_title = tm.group(3) or tm.group(4)
+
+    return page_count, filenames if filenames else None, book_title, text
+
+
+def _clean_download_url(raw_url):
+    """Port of the Go reference's cleanDownloadURL: percent-decode, resolve `..`
+    segments, normalise slashes, and deduplicate consecutive identical path segments."""
+    from urllib.parse import unquote
+    decoded = unquote(raw_url)               # Go: url.PathUnescape
+    decoded = decoded.replace("\\", "/")     # Go: strings.ReplaceAll(decoded, "\\", "/")
+    p = urlparse(decoded)
+    cleaned = posixpath.normpath(p.path)
+    # Deduplicate consecutive identical segments (e.g. /files/files/ → /files/)
+    segs = cleaned.split("/")
+    deduped = [segs[0]]
+    for i in range(1, len(segs)):
+        if segs[i] == segs[i - 1] and segs[i] != "":
+            continue
+        deduped.append(segs[i])
+    cleaned = "/".join(deduped)
+    return urlunparse((p.scheme, p.netloc, cleaned, p.params, p.query, p.fragment))
+
+
 def anyflip_is_protected(book_id, headers) -> bool:
     """Probe page 1 on the fast path. If it returns 403 (or similar small error body),
-    the book is DRM-protected and we need the WASM decoder path."""
+    the book is DRM-protected and we need the WASM decoder path.
+
+    Also checks config.js availability: if config.js itself has a pageCount the book
+    is readable via the fast path regardless of individual page probe results."""
+    # Primary check: can we get config.js with a usable pageCount?
+    count, _, _, _ = anyflip_fetch_config(book_id, headers)
+    if count > 0:
+        # Config is readable — now probe a single page to confirm images are reachable
+        url = f"https://online.anyflip.com/{book_id}/files/mobile/1.webp"
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200 and len(r.content) > 1000:
+                return False
+        except Exception:
+            pass
+
+    # Fallback: old-style direct probe
     url = f"https://online.anyflip.com/{book_id}/files/mobile/1.webp"
     try:
         r = requests.get(url, headers=headers, timeout=10)
-        # 200 + reasonable size = unprotected
         if r.status_code == 200 and len(r.content) > 1000:
             return False
-        # 403, 401, or tiny error-page body = protected
         return True
     except Exception:
-        # network issue — assume unprotected and let the main loop try
         return False
 
 
-def anyflip_download_page(book_id, page, headers, out_dir):
-    url = f"https://online.anyflip.com/{book_id}/files/mobile/{page}.webp"
-    filename = out_dir / f"{page:04d}.webp"
+def anyflip_download_page(book_id, page_num, page_url, headers, out_dir, max_retries=3):
+    """Download a single page image with retries and exponential backoff."""
+    ext = ".webp" if ".webp" in page_url.lower() else ".jpg"
+    filename = out_dir / f"{page_num:04d}{ext}"
 
-    try:
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200 and len(r.content) > 1000:
-            with open(filename, "wb") as f:
-                f.write(r.content)
-            return filename
-    except Exception:
-        pass
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(page_url, headers=headers, timeout=15)
+            if r.status_code == 200 and len(r.content) > 1000:
+                with open(filename, "wb") as f:
+                    f.write(r.content)
+                return filename
+            elif r.status_code in (429, 503):
+                _time_mod.sleep(2 ** attempt)
+                continue
+            else:
+                break  # 403/404 — no point retrying the same URL
+        except Exception:
+            if attempt < max_retries - 1:
+                _time_mod.sleep(1 + attempt)
 
     return None
 
 
-def anyflip_page_exists(book_id, page, headers):
-    """HEAD-check a single page. Returns True if the page exists (200 + real body size),
-    False if 403/404. Uses GET rather than HEAD because AnyFlip's CDN doesn't reliably
-    support HEAD for these paths."""
-    url = f"https://online.anyflip.com/{book_id}/files/mobile/{page}.webp"
-    try:
-        r = requests.get(url, headers=headers, timeout=10, stream=True)
-        # Read just a chunk to confirm real content — we don't need the whole body
-        exists = r.status_code == 200 and int(r.headers.get("content-length", "0") or "0") > 1000
-        r.close()
-        return exists
-    except Exception:
-        return False
+def anyflip_build_page_urls(book_id, page_count, filenames):
+    """Build the list of download URLs from config data.
+    Mirrors the Go reference exactly:
+      - If filenames exist: `/{book_id}/files/large/{filename}` then clean()
+        (this handles `../files/mobile/1.webp` → `/{book_id}/files/mobile/1.webp`
+         via path normalisation + consecutive-segment dedup).
+      - No filenames: `/{book_id}/files/mobile/{n}.jpg`"""
+    base = f"https://online.anyflip.com/{book_id}"
+    urls = []
 
-
-def anyflip_find_last_page(book_id, headers, hard_max=ANYFLIP_MAX_PAGES):
-    """Binary-search for the largest N such that page N exists.
-    Saves hundreds of wasted 404 requests on shorter books.
-
-    Strategy: exponential search upward to find an upper bound where the page
-    does NOT exist, then binary-search between the last confirmed page and that
-    upper bound. O(log N) requests instead of N."""
-    logger.info("🔍 Finding page count...")
-
-    # Step 1: exponential search to find an upper bound (first missing page)
-    if not anyflip_page_exists(book_id, 1, headers):
-        return 0  # no pages at all
-
-    lo = 1
-    probe = 2
-    while probe <= hard_max and anyflip_page_exists(book_id, probe, headers):
-        lo = probe
-        probe *= 2
-
-    # If we exited because probe exceeded hard_max but hard_max itself exists, we're capped.
-    if probe > hard_max:
-        if anyflip_page_exists(book_id, hard_max, headers):
-            logger.info(f"   → Book has ≥{hard_max} pages (hit hard cap)")
-            return hard_max
-        hi = hard_max
+    if filenames and len(filenames) >= page_count:
+        for name in filenames[:page_count]:
+            if name.startswith("http"):
+                urls.append(name)
+            else:
+                # Go: path.Join(bookPath, "files", "large", filename) → clean()
+                raw = f"{base}/files/large/{name}"
+                urls.append(_clean_download_url(raw))
     else:
-        hi = probe  # probe is first page known NOT to exist
+        for i in range(1, page_count + 1):
+            urls.append(f"{base}/files/mobile/{i}.jpg")
 
-    # Step 2: binary search between lo (exists) and hi (does not exist)
-    while lo + 1 < hi:
-        mid = (lo + hi) // 2
-        if anyflip_page_exists(book_id, mid, headers):
-            lo = mid
-        else:
-            hi = mid
-
-    logger.info(f"   → Book has {lo} pages")
-    return lo
+    return urls
 
 
 def anyflip_download_pages_fast(book_id, out_dir):
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": f"https://anyflip.com/{book_id}/basic/",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
     }
 
-    # Binary-search first so we only attempt pages that actually exist
-    last_page = anyflip_find_last_page(book_id, headers)
-    if last_page == 0:
-        logger.error("No pages found.")
-        return []
+    # ── Step 1: get page count + filenames from config.js (reliable, 1 request) ──
+    logger.info("🔍 Finding page count...")
+    page_count, filenames, book_title, _ = anyflip_fetch_config(book_id, headers)
 
+    if page_count == 0:
+        logger.error("No pages found.")
+        return [], None
+
+    logger.info(f"   → Book has {page_count} pages")
+
+    # ── Step 2: build URLs from config data ──
+    page_urls = anyflip_build_page_urls(book_id, page_count, filenames)
+
+    # ── Step 3: download with a thread pool ──
     images = []
 
     with ThreadPoolExecutor(max_workers=ANYFLIP_THREADS) as executor:
         futures = {
-            executor.submit(anyflip_download_page, book_id, page, headers, out_dir): page
-            for page in range(1, last_page + 1)
+            executor.submit(
+                anyflip_download_page, book_id, i + 1, url, headers, out_dir
+            ): i + 1
+            for i, url in enumerate(page_urls)
         }
 
-        with tqdm.tqdm(total=last_page, desc="📥 Downloading pages", unit="page", leave=True) as pbar:
+        with tqdm.tqdm(total=len(page_urls), desc="📥 Downloading pages", unit="page", leave=True) as pbar:
             for future in as_completed(futures):
                 result = future.result()
                 if result:
                     images.append(result)
                 pbar.update(1)
 
-    return images
+    return images, book_title
 
 
 def _validate_image(path):
@@ -380,10 +446,13 @@ def run_anyflip_fast(book_id: str, custom_filename: str):
         pages_dir = Path(temp_dir) / "pages"
         pages_dir.mkdir(exist_ok=True)
 
-        images = anyflip_download_pages_fast(book_id, pages_dir)
+        images, book_title = anyflip_download_pages_fast(book_id, pages_dir)
 
         if custom_filename:
             output_path = _resolve_output_path(get_safe_filename(custom_filename))
+        elif book_title:
+            # Use the real book title from config.js (ported from Go reference)
+            output_path = _resolve_output_path(get_safe_filename(book_title))
         else:
             output_path = _resolve_output_path(get_safe_filename(book_id.replace("/", "_")))
 
@@ -680,10 +749,18 @@ async def auto_fetch_keys_and_config(book_url: str, output_dir: str, config_host
                 except Exception:
                     pass
 
-        # Snapshot cookies for later httpx use
+        # Snapshot cookies for later httpx use — filter to essentials only.
+        # AnyFlip sets bloated tracking cookies whose combined size can exceed
+        # the CDN's header-size limit, causing HTTP 494 ("Request header too large").
         try:
-            cookies = await context.cookies()
-            result["cookies"] = {c["name"]: c["value"] for c in cookies}
+            all_cookies = await context.cookies()
+            filtered = {
+                c["name"]: c["value"]
+                for c in all_cookies
+                if c["name"] == "cf_clearance" or len(c["value"]) < 100
+            }
+            result["cookies"] = filtered
+            logger.info(f"  Kept {len(filtered)} essential cookies (discarded {len(all_cookies) - len(filtered)})")
         except Exception:
             pass
 
